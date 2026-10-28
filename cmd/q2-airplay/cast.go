@@ -88,23 +88,55 @@ type engine struct {
 	opt  engineOptions
 	poke chan struct{} // a choice: look at once
 
-	mu      sync.Mutex
-	want    *speaker // the chosen speaker; nil: this Q2
-	s       *session
-	status  string // the page's status line
-	obs     []obs
-	retryAt time.Time
-	retries int
+	mu            sync.Mutex
+	want          *speaker // the chosen speaker; nil: this Q2
+	s             *session
+	status        string // the page's status line
+	obs           []obs
+	retryAt       time.Time
+	retries       int
+	asked         *levelAsk      // the chosen speaker\'s volume being read
+	levels        map[string]int // each speaker\'s last volume
+	levelsChanged bool
 }
 
 type engineOptions struct {
 	bin, cmdpipe, dacp, remote, artFile string
-	track, config                       string // CAST_TRACK and demo's config.ini
+	track                               string         // CAST_TRACK
+	levels                              map[string]int // each speaker's last volume, by name
 	delayMS                             func() int
 }
 
 func newEngine(t *tap, o engineOptions) *engine {
-	return &engine{t: t, opt: o, poke: make(chan struct{}, 1)}
+	levels := map[string]int{}
+	for k, v := range o.levels {
+		levels[k] = v
+	}
+	return &engine{t: t, opt: o, poke: make(chan struct{}, 1), levels: levels}
+}
+
+// levelAsk is a speaker's own volume being read (speakerLevel), once a choice.
+type levelAsk struct {
+	key          string
+	done         chan struct{}
+	level        int
+	known        bool
+	waitingSince time.Time
+}
+
+// takeLevels is the speakers' volumes when one changed since the last call, for the settings.
+func (e *engine) takeLevels() (map[string]int, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.levelsChanged {
+		return nil, false
+	}
+	e.levelsChanged = false
+	m := make(map[string]int, len(e.levels))
+	for k, v := range e.levels {
+		m[k] = v
+	}
+	return m, true
 }
 
 // choose picks a speaker (nil: this Q2 again).
@@ -116,6 +148,15 @@ func (e *engine) choose(sp *speaker) {
 	e.retryAt = time.Time{}
 	if e.s != nil && (sp == nil || sp.key() != e.s.sp.key()) {
 		e.end("")
+	}
+	e.asked = nil
+	if sp != nil { // the speaker's own volume, asked aside so nothing waits on it
+		ask := &levelAsk{key: sp.key(), done: make(chan struct{})}
+		e.asked = ask
+		go func(sp speaker) {
+			ask.level, ask.known = speakerLevel(sp.IP, sp.Port, e.opt.dacp, e.opt.remote)
+			close(ask.done)
+		}(*sp)
 	}
 	if sp == nil {
 		e.status = ""
@@ -259,7 +300,18 @@ func (e *engine) step(now time.Time) {
 	}
 	s := e.s
 	if s == nil {
-		if now.Before(e.retryAt) {
+		waiting := false
+		if a := e.asked; a != nil {
+			select {
+			case <-a.done:
+			default:
+				if a.waitingSince.IsZero() {
+					a.waitingSince = now
+				}
+				waiting = now.Sub(a.waitingSince) < infoTimeout+500*time.Millisecond
+			}
+		}
+		if now.Before(e.retryAt) || waiting {
 			t.beat(monoNow, false, castConnecting)
 			return
 		}
@@ -336,43 +388,35 @@ func (e *engine) begin(now time.Time, monoNow int64, h head, compat bool) error 
 	if compat && sp.AirPlay2 {
 		proto = "airplay2-compat"
 	}
-	vol := savedVolume(e.opt.config) // the speaker's, as demo keeps it
+	// The volume: the speaker's own when it says (and cliairplay leaves it), else the one it had last
+	// from the Q2, set as it connects. demo shows and turns from it; the earphones keep theirs.
+	vol, known := 35, false
+	if a := e.asked; a != nil && a.key == sp.key() {
+		select {
+		case <-a.done:
+			vol, known = a.level, a.known
+		default:
+		}
+	}
+	if v, ok := e.levels[sp.Name]; ok && !known {
+		vol = v
+	}
+	send := clampVolume(vol)
+	if known {
+		send = 0 // as it is
+	}
 	snd, err := startSender(senderOptions{bin: e.opt.bin, cmdpipe: e.opt.cmdpipe, dacp: e.opt.dacp,
-		remote: e.opt.remote, name: "Shanling Q2", protocol: proto, volume: clampVolume(vol),
+		remote: e.opt.remote, name: "Shanling Q2", protocol: proto, volume: send,
 		latencyMS: e.opt.delayMS() + 500, sp: sp})
 	if err != nil {
 		return err
 	}
 	e.s = &session{sp: sp, snd: snd, compat: compat, volume: int32(vol), jumps: h.jumps,
 		track: e.t.track()} // start sends the tags
+	e.t.setLevel(clampVolume(vol))
 	e.t.setSpeaker(sp.Name)
 	e.status = "Connecting to " + sp.Name + "…"
 	return nil
-}
-
-// configFile is demo's config.ini, where it keeps the speaker's volume (Q2POD AIRVOL).
-const configFile = "/mnt/data/config.ini"
-
-// savedVolume is the speaker's volume as demo saved it (0-100), else its default, airplay.c's.
-func savedVolume(path string) int {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return 35
-	}
-	section := ""
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = line[1 : len(line)-1]
-			continue
-		}
-		if k, v, ok := strings.Cut(line, "="); ok && section == "Q2POD" && strings.TrimSpace(k) == "AIRVOL" {
-			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 && n <= 100 {
-				return n
-			}
-		}
-	}
-	return 35
 }
 
 func clampVolume(v int) int {
@@ -554,6 +598,8 @@ func (e *engine) extras(now time.Time, monoNow int64) {
 	if v := e.t.volume(); v >= 0 && v != s.volume { // demo's -1: not the speaker's yet
 		s.volume = v
 		s.snd.command("VOLUME=" + strconv.Itoa(clampVolume(int(v))))
+		e.levels[s.sp.Name] = clampVolume(int(v))
+		e.levelsChanged = true
 	}
 	if tr := e.t.track(); tr != s.track {
 		s.track = tr

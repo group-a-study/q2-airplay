@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
 	"net"
@@ -268,6 +269,80 @@ func has(dir, cmd string) int {
 	return n
 }
 
+// infoSpeaker answers GET /info as an AirPlay 2 speaker does, with initialVolume db, until the test
+// ends; its port.
+func infoSpeaker(t *testing.T, plist []byte) int {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil || line == "\r\n" {
+						break
+					}
+				}
+				fmt.Fprintf(c, "RTSP/1.0 200 OK\r\nContent-Type: application/x-apple-binary-plist\r\nCSeq: 1\r\nContent-Length: %d\r\n\r\n", len(plist))
+				c.Write(plist)
+			}()
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func mustHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// Binary plists as Python's plistlib writes them: /info-like dictionaries.
+var (
+	plistReal = mustHex("62706c6973743030d60102030405060708090a0b0c5864657669636549445866656174757265735d696e697469616c566f6c756d65556d6f64656c546e616d655b737461747573466c6167735541413a4242120012d68723c0280000000000005745726120313030574b69746368656e100408151e27353b404c52576068700000000000000101000000000000000d00000000000000000000000000000072") // initialVolume -12.0
+	plistInt  = mustHex("62706c6973743030d2010203045d696e697469616c566f6c756d65556d6f64656c10005158080d1b21230000000000000101000000000000000500000000000000000000000000000025")                                                                                                                                                                           // initialVolume 0
+	plistMute = mustHex("62706c6973743030d101025d696e697469616c566f6c756d6523c062000000000000080b190000000000000101000000000000000300000000000000000000000000000022")                                                                                                                                                                                     // initialVolume -144.0
+	plistNone = mustHex("62706c6973743030d301020304050b556d6f64656c566e65737465645a747874416972506c617955536f6e6f73d106075161a308090a100110021003460568656c6c6f080f151c272d303236383a3c0000000000000101000000000000000c00000000000000000000000000000043")                                                                                                 // no initialVolume
+)
+
+func TestLevel(t *testing.T) {
+	for _, c := range []struct {
+		b    []byte
+		want float64
+		ok   bool
+	}{{plistReal, -12, true}, {plistInt, 0, true}, {plistMute, -144, true}, {plistNone, 0, false}, {[]byte("bplist00 junk"), 0, false}} {
+		if v, ok := plistNumber(c.b, "initialVolume"); ok != c.ok || v != c.want {
+			t.Fatalf("%v %v, want %v %v", v, ok, c.want, c.ok)
+		}
+	}
+	// level inverts libraop's raopcl_float_volume (-30 + 30 * v / 100) for every v, 0 muted
+	for v := 1; v <= 100; v++ {
+		if got := level(-30 + 30*float64(v)/100); got != v {
+			t.Fatalf("level of %d's dB is %d", v, got)
+		}
+	}
+	if level(-144) != 0 || level(-30) != 0 || level(0) != 100 || level(-12) != 60 {
+		t.Fatal("level's ends")
+	}
+	if v, ok := speakerLevel("127.0.0.1", infoSpeaker(t, plistReal), "0011223344556677", "1"); !ok || v != 60 {
+		t.Fatalf("speakerLevel %d %v", v, ok)
+	}
+	if _, ok := speakerLevel("127.0.0.1", infoSpeaker(t, plistNone), "0011223344556677", "1"); ok {
+		t.Fatal("a level from a speaker that didn't say")
+	}
+}
+
 func TestEngine(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "fake")
@@ -281,7 +356,6 @@ func TestEngine(t *testing.T) {
 		t.Fatal("an existing tap isn't mapped again", err)
 	}
 	os.WriteFile(filepath.Join(dir, "track"), []byte("path=/mnt/mmc/a.flac\ntitle=Money\nartist=Pink Floyd\nalbum=DSOTM\nlength=382\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "config.ini"), []byte("[PLAYSET]\nVOLUME=50\n[Q2POD]\nAIRVOL=42\n"), 0o644)
 	tp.set(offVolume, 0xffffffff) // demo's -1 until the speaker plays: nothing sent
 
 	f := &filter{t: tp, id: 1, stop: make(chan struct{})}
@@ -290,18 +364,19 @@ func TestEngine(t *testing.T) {
 	go f.run()
 	const delay = 400
 	e := newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: "0011223344556677",
-		remote: "1", track: filepath.Join(dir, "track"), config: filepath.Join(dir, "config.ini"),
+		remote: "1", track: filepath.Join(dir, "track"), levels: map[string]int{"Kitchen": 42},
 		delayMS: func() int { return delay }})
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() { e.run(stop); close(done) }()
-	sp := speaker{Name: "Kitchen", IP: "10.0.0.5", Port: 7000, TXT: "features=0x445F8A00,0x1C340", AirPlay2: true}
+	// a speaker at 60 (-12 dB): the Q2 takes its volume, and cliairplay leaves it
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: infoSpeaker(t, plistReal), TXT: "features=0x445F8A00,0x1C340", AirPlay2: true}
 	e.choose(&sp)
 
 	// Connected, then started from what plays: the Q2 muted, demo told it plays.
 	waitFor(t, "START", 3*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
 	args, _ := os.ReadFile(filepath.Join(fake, "args"))
-	for _, want := range []string{"--protocol\nauto", "--volume\n42", "--txt\nfeatures=0x445F8A00,0x1C340", "--latency\n900", "10.0.0.5"} {
+	for _, want := range []string{"--protocol\nauto", "--volume\n0", "--txt\nfeatures=0x445F8A00,0x1C340", "--latency\n900", "127.0.0.1"} {
 		if !strings.Contains(string(args), want) {
 			t.Fatalf("args %q lack %q", args, want)
 		}
@@ -321,6 +396,9 @@ func TestEngine(t *testing.T) {
 		t.Fatalf("starts %d ms from now, not about %d", d, delay)
 	}
 	waitFor(t, "the mute", time.Second, func() bool { return tp.u32(offMute) == 1 && tp.u32(offState) == castOn })
+	if tp.i32(offSpk) != 60 || tp.u32(offSpkSeq) != 1 {
+		t.Fatalf("demo told %d (seq %d), not the speaker's 60", tp.i32(offSpk), tp.u32(offSpkSeq))
+	}
 
 	// The audio arrives whole and in order, in bursts.
 	waitFor(t, "audio", 3*time.Second, func() bool { st, _ := os.Stat(filepath.Join(fake, "audio")); return st != nil && st.Size() > 4*tapRate })
@@ -339,12 +417,18 @@ func TestEngine(t *testing.T) {
 		}
 	}
 
-	// The volume follows the Q2's wheel, once demo gives the speaker's.
-	if strings.Contains(strings.Join(commands(fake), "\n"), " VOLUME=") {
-		t.Fatalf("a volume sent before demo gave the speaker's: %v", commands(fake))
-	}
+	// The volume follows the Q2's wheel, once demo gives the speaker's: the speaker's own 60 back
+	// is no change, 61 is.
 	tp.set(offVolume, 60)
-	waitFor(t, "VOLUME", time.Second, func() bool { return has(fake, "VOLUME=60") == 1 })
+	time.Sleep(300 * time.Millisecond)
+	if strings.Contains(strings.Join(commands(fake), "\n"), " VOLUME=") {
+		t.Fatalf("a volume sent before the Q2 turned it: %v", commands(fake))
+	}
+	tp.set(offVolume, 61)
+	waitFor(t, "VOLUME", time.Second, func() bool { return has(fake, "VOLUME=61") == 1 })
+	if m, ok := e.takeLevels(); !ok || m["Kitchen"] != 61 {
+		t.Fatalf("the speaker's level not kept: %v %v", m, ok)
+	}
 
 	// A pause: everything sent is heard, then the stream is flushed; Play starts it again from the next
 	// frame, nothing lost.
@@ -374,18 +458,23 @@ func TestEngine(t *testing.T) {
 	}
 	waitFor(t, "audio after the seek", 3*time.Second, func() bool {
 		s := checkAudio()
-		return len(s) > 0 && int32(uint32(s[len(s)-1])-at&0xffff) > tapRate/4
+		d := int(s[len(s)-1] - uint16(at)) // frames are numbered mod 65536
+		return len(s) > 0 && d > tapRate/4 && d < 32768
 	})
-	// the stream after the last START begins at the jump (frames are numbered mod 65536)
-	var startBytes int
-	for _, c := range commands(fake) {
-		if strings.HasSuffix(c, " ACTION=START") {
-			startBytes, _ = strconv.Atoi(strings.Fields(c)[0])
+	// The stream breaks once, onto the jump, and runs on from it: frames are numbered mod 65536. (The
+	// stand-in reads commands and audio apart, so where START fell in its audio is not exact.)
+	s = checkAudio()
+	breaks := 0
+	for i := 1; i < len(s); i++ {
+		if s[i] != s[i-1]+1 {
+			breaks++
+			if s[i] != uint16(at) {
+				t.Fatalf("after the seek the stream goes on at %d, not the jump %d", s[i], uint16(at))
+			}
 		}
 	}
-	s = checkAudio()
-	if first := s[startBytes/4]; first != uint16(at) {
-		t.Fatalf("after the seek the stream starts at %d, not the jump %d", first, uint16(at))
+	if breaks != 1 {
+		t.Fatalf("%d breaks in the stream, not the seek's one", breaks)
 	}
 
 	// This Q2 again: the speaker let go and the Q2 aloud.
@@ -423,7 +512,7 @@ func TestNoDeadlock(t *testing.T) {
 		self: map[string]bool{}, conn: c, dest: c.LocalAddr().String()}} // queries to itself, not the network
 	a.load()
 	a.eng = newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: a.cfg.DACP,
-		remote: a.cfg.Remote, track: filepath.Join(dir, "track"), config: filepath.Join(dir, "config.ini"),
+		remote: a.cfg.Remote, track: filepath.Join(dir, "track"), levels: a.cfg.Volumes,
 		delayMS: a.delay})
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -435,7 +524,7 @@ func TestNoDeadlock(t *testing.T) {
 		case <-time.After(5 * time.Second):
 		}
 	}()
-	sp := speaker{Name: "Kitchen", IP: "10.0.0.5", Port: 7000, AirPlay2: true}
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true} // refused: no /info, the saved level
 	a.eng.choose(&sp)
 	waitFor(t, "START", 3*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
 	state := &q2.State{Path: filepath.Join(dir, "state")}
@@ -523,16 +612,5 @@ func TestArt(t *testing.T) {
 	}
 	if findArt(filepath.Join(other, "missing.flac"), out) != "" {
 		t.Fatal("art for nothing")
-	}
-}
-
-func TestSavedVolume(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "config.ini")
-	if savedVolume(p) != 35 {
-		t.Fatal("default")
-	}
-	os.WriteFile(p, []byte("[PLAYSET]\nAIRVOL=80\n[Q2POD]\nMONO=0\nAIRVOL = 23\n"), 0o644)
-	if savedVolume(p) != 23 {
-		t.Fatal(savedVolume(p))
 	}
 }

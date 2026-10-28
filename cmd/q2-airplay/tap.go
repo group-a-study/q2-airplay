@@ -29,6 +29,7 @@ const (
 	offPosRun, offSpeaker          = 32, 36
 	offSeq, offID, offPTS          = 100, 104, 108
 	offJumps, offJumpSeq, offDSD   = 112, 116, 120
+	offSpk, offSpkSeq              = 124, 156 // cast_tap's pad0, pad1: the speaker's volume for demo
 	offStamp                       = 128
 	offBeat, offStatus             = 136, 140
 	offVolume, offMaxVol, offTrack = 144, 148, 152
@@ -128,6 +129,17 @@ func (t *tap) stop() {
 	t.set(offMute, 0)
 	t.set(offState, castOff)
 	t.set(offWant, clock(q2.MonoNS())-1<<20) // long stale
+}
+
+// setLevel tells demo the speaker's volume (0-100), to show and turn from: the level, then a new
+// seq (0 means never told: an older app's padding).
+func (t *tap) setLevel(v int) {
+	t.set(offSpk, uint32(int32(v)))
+	seq := t.u32(offSpkSeq) + 1
+	if seq == 0 {
+		seq = 1
+	}
+	t.set(offSpkSeq, seq)
 }
 
 func (t *tap) setSpeaker(name string) {

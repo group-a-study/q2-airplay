@@ -16,8 +16,13 @@ lyrics and volume handling. For now those are only in group-a-study/q2-pod's tes
 
 While a speaker plays:
 
-- **Volume:** the wheel and keys set the speaker's volume. It's saved apart from the Q2's own, so your
-  earphones' level comes back when you switch back.
+- **Volume:** the wheel and keys set the speaker's volume, kept apart from the earphones': changing
+  one never changes the other, and the Q2 stays silent until your earphones' level is back.
+  - When you pick a speaker, the Q2 shows its real volume if the speaker reports it (AirPlay 2
+    speakers give it before connecting), else the level it had last from the Q2.
+  - The Q2 doesn't hear about changes made in the speaker's own app while it plays; your next turn of
+    the wheel sets the speaker from the Q2's number.
+  - The Volume Limit is for earphones, so it's lifted while a speaker plays.
 - **Delay:** the speaker plays a fixed delay behind the Q2, 1 s by default. It's set on the AirPlay page
   (0.75–3 s); more rides out weak Wi-Fi.
 - **Pause, skip and seek:** the speaker does the same, the delay later. A pause stops it exactly where

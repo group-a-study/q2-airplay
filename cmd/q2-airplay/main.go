@@ -26,13 +26,15 @@ import (
 	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
-const version = "q2-v1.2"
+const version = "q2-v1.3"
 
 // settings is .airplay/config.json.
 type settings struct {
 	DACP    string `json:"dacp"`     // this sender's AirPlay identity, kept so a speaker knows it again
 	Remote  string `json:"remote"`   // its Active-Remote id
 	DelayMS int    `json:"delay_ms"` // how far behind the Q2 the speaker plays
+	// each speaker's volume as the Q2 last set it, by name, for one that doesn't say its own
+	Volumes map[string]int `json:"volumes,omitempty"`
 }
 
 var delays = []int{750, 1000, 1500, 2000, 3000}
@@ -81,7 +83,7 @@ func main() {
 		os.Exit(1)
 	}
 	a.eng = newEngine(t, engineOptions{bin: *bin, cmdpipe: "/tmp/q2-airplay.cmd", dacp: a.cfg.DACP,
-		remote: a.cfg.Remote, artFile: "/tmp/q2-airplay-art", track: trackFile, config: configFile,
+		remote: a.cfg.Remote, artFile: "/tmp/q2-airplay-art", track: trackFile, levels: a.cfg.Volumes,
 		delayMS: a.delay})
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -123,8 +125,13 @@ func (a *app) second(now time.Time, t *tap, state *q2.State) bool {
 		hold = "1"
 	}
 	state.Write(map[string]string{"hold": hold, "version": version})
+	levels, changed := a.eng.takeLevels()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if changed {
+		a.cfg.Volumes = levels
+		a.save()
+	}
 	return !active && now.Sub(a.asked) > idleExit && now.Sub(a.started) > idleExit
 }
 
