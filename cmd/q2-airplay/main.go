@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,7 +26,7 @@ import (
 	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
-const version = "q2-v1.1"
+const version = "q2-v1.2"
 
 // settings is .airplay/config.json.
 type settings struct {
@@ -46,6 +47,7 @@ const (
 
 type app struct {
 	dir     string
+	delayMS atomic.Int32 // the engine's, read without mu: the engine holds its own lock then
 	mu      sync.Mutex
 	cfg     settings
 	eng     *engine
@@ -96,17 +98,7 @@ loop:
 		case <-sig:
 			break loop
 		case now := <-tick.C:
-			a.discover(now)
-			playing := a.eng.active() && t.status() == playPlaying
-			hold := "0"
-			if playing {
-				hold = "1"
-			}
-			state.Write(map[string]string{"hold": hold, "version": version})
-			a.mu.Lock()
-			idle := !a.eng.active() && now.Sub(a.asked) > idleExit && now.Sub(a.started) > idleExit
-			a.mu.Unlock()
-			if idle {
+			if a.second(now, t, state) {
 				break loop
 			}
 		}
@@ -118,10 +110,22 @@ loop:
 	os.Exit(code)
 }
 
-func (a *app) delay() int {
+func (a *app) delay() int { return int(a.delayMS.Load()) }
+
+// second is the main loop's work once a second: speakers looked for, Q2 Pod told whether to hold
+// standby off (a speaker playing). True when the app should end, unused and nothing chosen. The
+// engine is asked outside mu: it takes its own lock, so nesting them here could deadlock with it.
+func (a *app) second(now time.Time, t *tap, state *q2.State) bool {
+	a.discover(now)
+	active := a.eng.active()
+	hold := "0"
+	if active && t.status() == playPlaying {
+		hold = "1"
+	}
+	state.Write(map[string]string{"hold": hold, "version": version})
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.cfg.DelayMS
+	return !active && now.Sub(a.asked) > idleExit && now.Sub(a.started) > idleExit
 }
 
 // load reads the settings, making the identity the first time.
@@ -150,6 +154,7 @@ func (a *app) load() {
 	if changed {
 		a.save()
 	}
+	a.delayMS.Store(int32(a.cfg.DelayMS))
 }
 
 func (a *app) save() {
@@ -207,6 +212,7 @@ func (a *app) handle(r q2spot.Request) q2spot.Reply {
 			}
 		}
 		a.cfg.DelayMS = next
+		a.delayMS.Store(int32(next))
 		a.save()
 		a.mu.Unlock()
 		msg := ""

@@ -25,6 +25,7 @@ const (
 	tickIdle      = time.Second            // no speaker chosen
 	batchMS       = 200                    // audio is sent in bursts this long: the radio sleeps between them
 	gapMS         = 150                    // tap frames this much later than their place on the speaker's timeline: a gap (pause, stall), kept as silence
+	restartMS     = 5000                   // a gap this long: flushed and started again instead
 	parkAfterMS   = 100                    // paused this long past the last frame heard: flushed and parked
 	minLeadMS     = 300                    // a start at least this far ahead
 	positionEvery = 200 * time.Millisecond
@@ -43,7 +44,7 @@ const (
 	phParked                  // flushed: the next start waits for play
 )
 
-// run is a span of fed frames: seq's frames from aud (unix ms) on.
+// run is a span of fed frames: seq's frames from aud (CLOCK_MONOTONIC ms) on.
 type run struct {
 	aud float64
 	seq uint32
@@ -67,7 +68,7 @@ type session struct {
 	connected  time.Time
 	clockReady bool
 	fed        uint32  // the next frame to send
-	nextAud    float64 // unix ms the next frame sent is heard at
+	nextAud    float64 // CLOCK_MONOTONIC ms the next frame sent is heard at
 	pending    []byte
 	lastSend   time.Time
 	started    bool // a start was made: the Q2's own output is muted
@@ -190,11 +191,14 @@ func (e *engine) end(why string) {
 	}
 }
 
-func unixMS(now time.Time) float64 { return float64(now.UnixNano()) / 1e6 }
+// The speaker's timeline is kept in CLOCK_MONOTONIC ms, so a jump of the wall clock (set from the
+// network once Wi-Fi is back, say) moves nothing; only START's instant is wall-clock, as cliairplay
+// takes it.
+func monoMS(ns int64) float64 { return float64(ns) / 1e6 }
 
-// monoToUnix is the wall-clock time (ms) of a CLOCK_MONOTONIC instant.
-func monoToUnix(mono int64, now time.Time, monoNow int64) float64 {
-	return unixMS(now) - float64(monoNow-mono)/1e6
+// unixAt is the wall-clock ms of the monotonic ms at.
+func unixAt(at float64, now time.Time, monoNow int64) int64 {
+	return int64(at + float64(now.UnixNano())/1e6 - monoMS(monoNow))
 }
 
 // see keeps the filter's head when it moved, for tap times and song places (10 s of them).
@@ -304,12 +308,18 @@ func (e *engine) step(now time.Time) {
 			}
 		}
 		e.feed(now, monoNow, h)
+		if e.s == nil || s.phase != phPlaying { // it ended, or started again
+			break
+		}
 		if t.status() != playPlaying && h.seq == s.fed {
 			e.sendPending(now, true)
-			if unixMS(now) > s.nextAud+parkAfterMS {
+			if e.s != nil && monoMS(monoNow) > s.nextAud+parkAfterMS {
 				e.flush(false, s.fed)
 			}
 		}
+	}
+	if e.s == nil { // cliairplay stopped taking audio: lost
+		return
 	}
 	if h.dsd && t.status() == playPlaying && s.phase != phConnecting {
 		e.status = "DSD plays on the Q2 only"
@@ -409,7 +419,7 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 			ms := float64(ev.int64("shifted_frames")) * 1000 / tapRate
 			s.nextAud += ms
 			for i := range s.runs {
-				if s.runs[i].aud+float64(s.runs[i].n)*1000/tapRate > unixMS(now) {
+				if s.runs[i].aud+float64(s.runs[i].n)*1000/tapRate > monoMS(monoNow) {
 					s.runs[i].aud += ms
 				}
 			}
@@ -461,8 +471,8 @@ func (e *engine) lost(now time.Time, h head) {
 // start schedules frame from to be heard delay after it was put in the ring.
 func (e *engine) start(now time.Time, monoNow int64, from uint32) {
 	s := e.s
-	at := monoToUnix(e.tapTime(from), now, monoNow) + float64(e.opt.delayMS())
-	if earliest := unixMS(now) + minLeadMS; at < earliest {
+	at := monoMS(e.tapTime(from)) + float64(e.opt.delayMS())
+	if earliest := monoMS(monoNow) + minLeadMS; at < earliest {
 		at = earliest
 	}
 	if !s.started {
@@ -472,7 +482,7 @@ func (e *engine) start(now time.Time, monoNow int64, from uint32) {
 	s.nextAud = at
 	s.runs = s.runs[:0]
 	s.pending = s.pending[:0]
-	s.snd.command(fmt.Sprintf("START_UNIX_MS=%d", int64(at)), "ACTION=START")
+	s.snd.command(fmt.Sprintf("START_UNIX_MS=%d", unixAt(at, now, monoNow)), "ACTION=START")
 	s.phase = phPlaying
 	s.started = true
 }
@@ -488,8 +498,13 @@ func (e *engine) feed(now time.Time, monoNow int64, h head) {
 		e.flush(true, h.seq)
 		return
 	}
-	want := monoToUnix(e.tapTime(s.fed), now, monoNow) + float64(e.opt.delayMS())
-	if gap := want - s.nextAud; gap > gapMS { // a pause or a stall on the Q2: the same silence here
+	want := monoMS(e.tapTime(s.fed)) + float64(e.opt.delayMS())
+	gap := want - s.nextAud
+	if gap > restartMS { // too long to bridge with silence: start again from here
+		e.flush(true, s.fed)
+		return
+	}
+	if gap > gapMS { // a pause or a stall on the Q2: the same silence here
 		k := int(gap * tapRate / 1000)
 		s.pending = append(s.pending, make([]byte, 4*k)...)
 		s.nextAud += float64(k) * 1000 / tapRate
@@ -501,7 +516,7 @@ func (e *engine) feed(now time.Time, monoNow int64, h head) {
 	s.pending = e.t.frames(s.pending, s.fed, n)
 	s.fed += uint32(n)
 	s.nextAud += float64(n) * 1000 / tapRate
-	e.sendPending(now, false)
+	e.sendPending(now, false) // may end the session
 }
 
 // sendPending hands the batch to cliairplay once it holds batchMS (or now, when all).
@@ -574,7 +589,7 @@ func (e *engine) metadata(now time.Time) {
 // position tells demo where in the song the speaker is.
 func (e *engine) position(now time.Time, monoNow int64) {
 	s := e.s
-	at := unixMS(now)
+	at := monoMS(monoNow)
 	for i := len(s.runs) - 1; i >= 0; i-- {
 		r := s.runs[i]
 		if at < r.aud {

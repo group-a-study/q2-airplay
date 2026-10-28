@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/group-a-study/q2-airplay/internal/q2"
+	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
 // TestMain runs as a stand-in cliairplay when FAKE_CLIAIRPLAY names a directory: it records its
@@ -395,6 +396,77 @@ func TestEngine(t *testing.T) {
 	}
 	close(stop)
 	<-done
+}
+
+// TestNoDeadlock runs the main loop's second, the page's requests and a delay change against an
+// engine sending: each must return. 1.0 hung within minutes when the main loop held the app's lock
+// while asking the engine, which held its own while asking the app for the delay.
+func TestNoDeadlock(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "fake")
+	os.Mkdir(fake, 0o755)
+	t.Setenv("FAKE_CLIAIRPLAY", fake)
+	tp, err := openTap(filepath.Join(dir, "q2cast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &filter{t: tp, id: 1, stop: make(chan struct{})}
+	defer close(f.stop)
+	f.set(true)
+	go f.run()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	a := &app{dir: dir, started: time.Now(), br: &browser{services: map[string]*service{}, hosts: map[string]net.IP{},
+		self: map[string]bool{}, conn: c, dest: c.LocalAddr().String()}} // queries to itself, not the network
+	a.load()
+	a.eng = newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: a.cfg.DACP,
+		remote: a.cfg.Remote, track: filepath.Join(dir, "track"), config: filepath.Join(dir, "config.ini"),
+		delayMS: a.delay})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { a.eng.run(stop); close(done) }()
+	defer func() { // a deadlocked engine never ends: don't wait for it
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+	sp := speaker{Name: "Kitchen", IP: "10.0.0.5", Port: 7000, AirPlay2: true}
+	a.eng.choose(&sp)
+	waitFor(t, "START", 3*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
+	state := &q2.State{Path: filepath.Join(dir, "state")}
+	end := time.Now().Add(1500 * time.Millisecond)
+	var wg sync.WaitGroup
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for time.Now().Before(end) {
+				switch g {
+				case 0:
+					a.second(time.Now(), tp, state)
+				case 1:
+					a.handle(q2spot.Request{Op: "menu"})
+				case 2:
+					a.handle(q2spot.Request{Op: "delay"})
+				}
+			}
+		}(g)
+	}
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlocked")
+	}
+	if b, _ := os.ReadFile(state.Path); !strings.Contains(string(b), "hold=1") {
+		t.Fatalf("no hold while a speaker plays: %q", b)
+	}
 }
 
 func TestArt(t *testing.T) {

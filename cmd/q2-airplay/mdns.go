@@ -54,6 +54,7 @@ type browser struct {
 	hosts    map[string]net.IP   // A records, by name
 	self     map[string]bool     // this device's addresses
 	conn     *net.UDPConn
+	dest     string // where queries go: mdnsAddr
 }
 
 func newBrowser() (*browser, error) {
@@ -61,7 +62,7 @@ func newBrowser() (*browser, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &browser{services: map[string]*service{}, hosts: map[string]net.IP{}, conn: c}
+	b := &browser{services: map[string]*service{}, hosts: map[string]net.IP{}, conn: c, dest: mdnsAddr}
 	go b.read()
 	return b, nil
 }
@@ -78,7 +79,10 @@ func (b *browser) query() {
 		}
 	}
 	b.mu.Unlock()
-	to, _ := net.ResolveUDPAddr("udp4", mdnsAddr)
+	to, err := net.ResolveUDPAddr("udp4", b.dest)
+	if err != nil || b.conn == nil {
+		return
+	}
 	for len(qs) > 0 { // a few questions a packet
 		n := len(qs)
 		if n > 8 {
