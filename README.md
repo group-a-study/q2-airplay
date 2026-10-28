@@ -34,6 +34,16 @@ While a speaker plays:
 - **Sound quality:** it goes out as lossless ALAC at 44.1 kHz/16-bit, what AirPlay carries.
   16-bit/44.1 kHz songs arrive bit for bit. Hi-res ones are converted on the Q2.
 
+If the sound drops, the AirPlay page's **Dropouts** line says how many there were and what caused the
+last one: the Q2's player stopping, audio reaching the speaker late over Wi-Fi, the speaker losing the
+Q2's clock, or the connection ending.
+
+**Troubleshooting log (for now):** while dropouts are being chased, the app keeps a log at the card's
+root, `q2-airplay.log` (2 MB, then `q2-airplay.log.1`). It records the app's steps, cliairplay's own
+messages, and every 2 s the player's output, the audio device's state, CPU, load and Wi-Fi signal. It's
+written every few seconds, so after a dropout wait 10 s, then copy it off (USB or File Browser). It goes
+away once the dropouts are fixed.
+
 What can't be played on a speaker: DSD (it goes to the Q2's DAC untouched). Spotify, Internet Radio and
 Videos have their own players, which this doesn't reach.
 

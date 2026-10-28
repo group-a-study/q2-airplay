@@ -26,7 +26,13 @@ func TestMain(m *testing.M) {
 		fakeSender(dir, os.Args[1:])
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	if p := os.Getenv("Q2_TEST_LOG"); p != "" { // the troubleshooting log, read on this machine
+		dbg = openLog(p)
+		defer dbg.flush()
+	}
+	code := m.Run()
+	dbg.flush()
+	os.Exit(code)
 }
 
 func fakeSender(dir string, args []string) {
@@ -581,9 +587,12 @@ func TestStall(t *testing.T) {
 	done := make(chan struct{})
 	go func() { e.run(stop); close(done) }()
 	defer func() { close(stop); <-done }()
-	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true}
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true} // no /info, no saved level
 	e.choose(&sp)
 	waitFor(t, "START", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
+	if args, _ := os.ReadFile(filepath.Join(fake, "args")); !strings.Contains(string(args), "--volume\n35\n") || tp.i32(offSpk) != 35 {
+		t.Fatalf("a speaker that says nothing starts at %d, not 35 (%q)", tp.i32(offSpk), args)
+	}
 	frames := func() []uint16 {
 		b, _ := os.ReadFile(filepath.Join(fake, "audio"))
 		s := make([]uint16, 0, len(b)/4)
@@ -613,6 +622,9 @@ func TestStall(t *testing.T) {
 	if has(fake, "ACTION=FLUSH") != 0 {
 		t.Fatalf("a 1 s stall flushed: %v", commands(fake))
 	}
+	if d := e.dropouts(time.Now()); !strings.HasPrefix(d, "1 dropout; the last, just now: the Q2's player stopped giving audio") {
+		t.Fatalf("the page says %q", d)
+	}
 	s := frames()
 	zeros, i := 0, 0
 	for i = 1; i < len(s); i++ {
@@ -631,6 +643,9 @@ func TestStall(t *testing.T) {
 	waitFor(t, "a new start after the long stall", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 2 })
 	if has(fake, "ACTION=FLUSH") != 1 {
 		t.Fatalf("%v", commands(fake))
+	}
+	if d := e.dropouts(time.Now()); !strings.HasPrefix(d, "2 dropouts; the last, just now: the Q2's player stopped giving audio") {
+		t.Fatalf("the page says %q", d)
 	}
 	waitFor(t, "audio after the long stall", 3*time.Second, func() bool {
 		s := frames()

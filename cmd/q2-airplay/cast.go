@@ -81,6 +81,10 @@ type session struct {
 	runs       []run
 	lastPos    time.Time
 	err        string
+	moved      time.Time // when the filter's head last moved while playing
+	seen       uint32    // the head then
+	stalled    bool      // a stall noted, until it moves again
+	paused     bool      // the player paused since the last frames: their gap is a pause, not a dropout
 }
 
 type engine struct {
@@ -95,9 +99,43 @@ type engine struct {
 	obs           []obs
 	retryAt       time.Time
 	retries       int
-	asked         *levelAsk      // the chosen speaker\'s volume being read
-	levels        map[string]int // each speaker\'s last volume
+	asked         *levelAsk      // the chosen speaker's volume being read
+	levels        map[string]int // each speaker's last volume
 	levelsChanged bool
+	// The last dropout's cause, when and how many since the speaker was chosen: the page shows
+	// them, so a dropout can be told apart without a log on the Q2.
+	trouble   string
+	troubleAt time.Time
+	troubles  int
+	probe     probe
+	heartAt   time.Time
+}
+
+// note records a dropout's cause for the page.
+func (e *engine) note(now time.Time, why string) {
+	dbg.printf("dropout: %s", why)
+	e.trouble, e.troubleAt = why, now
+	e.troubles++
+}
+
+// dropouts is the page's line about them: how many, and the last's cause and age; "" without one.
+func (e *engine) dropouts(now time.Time) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.troubles == 0 {
+		return ""
+	}
+	age := "just now"
+	if m := int(now.Sub(e.troubleAt).Minutes()); m == 1 {
+		age = "1 min ago"
+	} else if m > 1 {
+		age = fmt.Sprintf("%d min ago", m)
+	}
+	n := "1 dropout"
+	if e.troubles > 1 {
+		n = fmt.Sprintf("%d dropouts", e.troubles)
+	}
+	return fmt.Sprintf("%s; the last, %s: %s", n, age, e.trouble)
 }
 
 type engineOptions struct {
@@ -146,6 +184,7 @@ func (e *engine) choose(sp *speaker) {
 	e.want = sp
 	e.retries = 0
 	e.retryAt = time.Time{}
+	e.troubles, e.trouble = 0, ""
 	if e.s != nil && (sp == nil || sp.key() != e.s.sp.key()) {
 		e.end("")
 	}
@@ -359,7 +398,17 @@ func (e *engine) step(now time.Time) {
 				break
 			}
 		}
-		e.feed(now, monoNow, h)
+		playing, moved := t.status() == playPlaying, h.seq != s.seen
+		if !playing {
+			s.paused = true
+		} else if !moved && !s.stalled && now.Sub(s.moved) > 1500*time.Millisecond {
+			s.stalled = true // playing, the player says, but no audio comes from it
+			e.note(now, "the Q2's player stopped giving audio while playing")
+		}
+		e.feed(now, monoNow, h) // its gap notes see the stall and pause marks first
+		if moved || !playing {
+			s.seen, s.moved, s.stalled = h.seq, now, false
+		}
 		if e.s == nil || s.phase != phPlaying { // it ended, or started again
 			break
 		}
@@ -379,6 +428,16 @@ func (e *engine) step(now time.Time) {
 		e.status = "Playing on " + s.sp.Name
 	}
 	e.extras(now, monoNow)
+	if dbg != nil && now.Sub(e.heartAt) >= heartEvery {
+		e.heartAt = now
+		pid := 0
+		if s.snd.cmd.Process != nil {
+			pid = s.snd.cmd.Process.Pid
+		}
+		dbg.printf("hb phase=%d status=%d seq=%d fed=%d lag=%d lead=%.0fms pending=%d q=%d stamp_age=%dms dsd=%v vol=%d %s",
+			s.phase, t.status(), h.seq, s.fed, int32(h.seq-s.fed), s.nextAud-monoMS(monoNow), len(s.pending),
+			len(s.snd.audio), (monoNow-h.stamp)/1e6, h.dsd, t.volume(), e.probe.line(now, t, pid))
+	}
 }
 
 // begin starts cliairplay for the chosen speaker; compat: the AirPlay 1 flow.
@@ -394,7 +453,9 @@ func (e *engine) begin(now time.Time, monoNow int64, h head, compat bool) error 
 	if a := e.asked; a != nil && a.key == sp.key() {
 		select {
 		case <-a.done:
-			vol, known = a.level, a.known
+			if a.known {
+				vol, known = a.level, true
+			}
 		default:
 		}
 	}
@@ -413,6 +474,8 @@ func (e *engine) begin(now time.Time, monoNow int64, h head, compat bool) error 
 	}
 	e.s = &session{sp: sp, snd: snd, compat: compat, volume: int32(vol), jumps: h.jumps,
 		track: e.t.track()} // start sends the tags
+	dbg.printf("begin %s %s:%d airplay2=%v proto=%s volume=%d (the speaker's own: %v) delay=%d", sp.Name, sp.IP,
+		sp.Port, sp.AirPlay2, proto, vol, known, e.opt.delayMS())
 	e.t.setLevel(clampVolume(vol))
 	e.t.setSpeaker(sp.Name)
 	e.status = "Connecting to " + sp.Name + "…"
@@ -439,6 +502,7 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		default:
 			return
 		}
+		dbg.printf("event %s", ev)
 		switch ev.kind {
 		case "connected":
 			s.connected = now
@@ -447,6 +511,9 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		case "clock_ready":
 			st := ev.kv["state"]
 			s.clockReady = s.clockReady || st == "ready" || ev.kv["mode"] == "ntp"
+			if st == "stalled" {
+				e.note(now, s.sp.Name+" stopped following the Q2's clock")
+			}
 		case "started":
 			// The speaker may start later than asked: everything sent moves with it.
 			if d := float64(ev.int64("at_unix_ms") - ev.int64("requested_unix_ms")); d > 0 {
@@ -461,6 +528,9 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 			}
 		case "REANCHOR":
 			ms := float64(ev.int64("shifted_frames")) * 1000 / tapRate
+			if !s.stalled { // not the player's: the stream reached the speaker late
+				e.note(now, fmt.Sprintf("audio reached %s %.1f s late (Wi-Fi)", s.sp.Name, ms/1000))
+			}
 			s.nextAud += ms
 			for i := range s.runs {
 				if s.runs[i].aud+float64(s.runs[i].n)*1000/tapRate > monoMS(monoNow) {
@@ -470,6 +540,7 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		case "flushed":
 			if s.phase == phFlushing {
 				s.phase = phParked
+				dbg.printf("parked (jump=%v)", s.jumping)
 				if s.jumping {
 					s.jumping = false
 					s.fed = s.jumpTo
@@ -479,6 +550,9 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		case "error", "fatal":
 			if d := ev.kv["detail"]; d != "" {
 				s.err = d
+				if s.started {
+					e.note(now, d)
+				}
 			}
 		case "exit":
 			e.lost(now, h)
@@ -498,6 +572,11 @@ func (e *engine) lost(now time.Time, h head) {
 	if why == "" {
 		why = "the connection ended"
 	}
+	if s.started {
+		e.note(now, "the connection to "+s.sp.Name+" ended: "+why)
+	}
+	dbg.printf("lost %s: %s (connected %v, AirPlay 1 %v, retries %d)", s.sp.Name, why, !s.connected.IsZero(),
+		s.compat, e.retries)
 	e.retries++
 	if s.connected.IsZero() && s.sp.AirPlay2 && !s.compat {
 		e.retryAt = now // straight to AirPlay 1
@@ -527,6 +606,7 @@ func (e *engine) start(now time.Time, monoNow int64, from uint32) {
 	s.runs = s.runs[:0]
 	s.pending = s.pending[:0]
 	s.snd.command(fmt.Sprintf("START_UNIX_MS=%d", unixAt(at, now, monoNow)), "ACTION=START")
+	dbg.printf("start from=%d lead=%.0fms (tap +%d ms)", from, at-monoMS(monoNow), e.opt.delayMS())
 	s.phase = phPlaying
 	s.started = true
 }
@@ -545,8 +625,18 @@ func (e *engine) feed(now time.Time, monoNow int64, h head) {
 	want := monoMS(e.tapTime(s.fed)) + float64(e.opt.delayMS())
 	gap := want - s.nextAud
 	if gap > restartMS { // too long to bridge with silence: start again from here
+		if !s.stalled {
+			e.note(now, fmt.Sprintf("the Q2's player stopped for %.0f s", gap/1000))
+		}
 		e.flush(true, s.fed)
 		return
+	}
+	if gap > gapMS && !s.paused && !s.stalled { // silence while playing: the player stalled
+		e.note(now, fmt.Sprintf("the Q2's player stopped giving audio for %.1f s", gap/1000))
+	}
+	s.paused = false
+	if gap > gapMS {
+		dbg.printf("gap %.0fms before frame %d (paused or stalled)", gap, s.fed)
 	}
 	if gap > gapMS { // a pause or a stall on the Q2: the same silence here
 		k := int(gap * tapRate / 1000)
@@ -585,6 +675,7 @@ func (e *engine) flush(jump bool, to uint32) {
 	s.pending = s.pending[:0]
 	s.snd.drained(time.Second)
 	s.snd.command("ACTION=FLUSH")
+	dbg.printf("flush jump=%v to=%d", jump, to)
 	s.phase = phFlushing
 	s.jumping = jump
 	s.jumpTo = to

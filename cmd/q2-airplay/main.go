@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ import (
 	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
-const version = "q2-v1.4"
+const version = "q2-v1.5"
 
 const appNice, senderNice = -5, -8 // the app's and cliairplay's (its PTP and sends keep time)
 
@@ -68,6 +69,7 @@ func main() {
 	browse := flag.String("browse", "/tmp/q2-airplay.browse.sock", "the Q2SPOT/1 socket")
 	statusFile := flag.String("status", "/tmp/q2-airplay.state", "the status file Q2 Pod reads")
 	showVersion := flag.Bool("version", false, "print the version")
+	logPath := flag.String("log", "/mnt/mmc/q2-airplay.log", "the troubleshooting log (\"\": none)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -75,7 +77,9 @@ func main() {
 	}
 	// hciplayer runs at nice -5: at the same priority, nothing else on the Q2 starves the stream (on
 	// one core, a hi-res album and Low Power's dark screen did); cliairplay goes a little above.
-	syscall.Setpriority(syscall.PRIO_PROCESS, 0, appNice)
+	dbg = openLog(*logPath)
+	nice := syscall.Setpriority(syscall.PRIO_PROCESS, 0, appNice)
+	dbg.printf("%s started: nice %d (%v), CPUs %d", version, appNice, nice, runtime.NumCPU())
 	a := &app{dir: *dir, started: time.Now()}
 	a.load()
 	t, err := openTap(tapFile)
@@ -112,6 +116,8 @@ loop:
 	}
 	close(stop)
 	<-done
+	dbg.printf("%s ends", version)
+	dbg.flush()
 	state.Remove()
 	os.Remove(*browse)
 	os.Exit(code)
@@ -243,6 +249,9 @@ func (a *app) menu(now time.Time) q2spot.Reply {
 	rows := []q2spot.Row{}
 	if line != "" {
 		rows = append(rows, q2spot.Row{Kind: "info", Title: line})
+	}
+	if d := a.eng.dropouts(now); d != "" && chosen != "" {
+		rows = append(rows, q2spot.Row{Kind: "info", Title: "Dropouts", Subtitle: d})
 	}
 	here := ""
 	if chosen == "" {
