@@ -20,11 +20,13 @@ import (
 // speaker is let go (or this app stops beating: the payload lets go by itself).
 
 const (
-	tickEvery     = 50 * time.Millisecond
-	batchMS       = 200 // audio is sent in bursts this long: the radio sleeps between them
-	gapMS         = 150 // tap frames this much later than their place on the speaker's timeline: a gap (pause, stall), kept as silence
-	parkAfterMS   = 100 // paused this long past the last frame heard: flushed and parked
-	minLeadMS     = 300 // a start at least this far ahead
+	tickPlaying   = 100 * time.Millisecond // sending: the tap's ring holds 5.9 s, the delay covers it
+	tickWaiting   = 250 * time.Millisecond // connecting, paused or parked: within a quarter second of Play
+	tickIdle      = time.Second            // no speaker chosen
+	batchMS       = 200                    // audio is sent in bursts this long: the radio sleeps between them
+	gapMS         = 150                    // tap frames this much later than their place on the speaker's timeline: a gap (pause, stall), kept as silence
+	parkAfterMS   = 100                    // paused this long past the last frame heard: flushed and parked
+	minLeadMS     = 300                    // a start at least this far ahead
 	positionEvery = 200 * time.Millisecond
 	readyWait     = 6 * time.Second // the speaker's clock not ready by then: started anyway
 	maxQueued     = 2 * time.Second // sent but not taken by cliairplay this long: it's stuck
@@ -81,8 +83,9 @@ type session struct {
 }
 
 type engine struct {
-	t   *tap
-	opt engineOptions
+	t    *tap
+	opt  engineOptions
+	poke chan struct{} // a choice: look at once
 
 	mu      sync.Mutex
 	want    *speaker // the chosen speaker; nil: this Q2
@@ -99,7 +102,9 @@ type engineOptions struct {
 	delayMS                             func() int
 }
 
-func newEngine(t *tap, o engineOptions) *engine { return &engine{t: t, opt: o} }
+func newEngine(t *tap, o engineOptions) *engine {
+	return &engine{t: t, opt: o, poke: make(chan struct{}, 1)}
+}
 
 // choose picks a speaker (nil: this Q2 again).
 func (e *engine) choose(sp *speaker) {
@@ -113,6 +118,10 @@ func (e *engine) choose(sp *speaker) {
 	}
 	if sp == nil {
 		e.status = ""
+	}
+	select {
+	case e.poke <- struct{}{}:
+	default:
 	}
 }
 
@@ -133,8 +142,8 @@ func (e *engine) active() bool {
 }
 
 func (e *engine) run(stop <-chan struct{}) {
-	tick := time.NewTicker(tickEvery)
-	defer tick.Stop()
+	timer := time.NewTimer(tickIdle)
+	defer timer.Stop()
 	for {
 		select {
 		case <-stop:
@@ -143,12 +152,30 @@ func (e *engine) run(stop <-chan struct{}) {
 			e.end("")
 			e.mu.Unlock()
 			return
-		case <-tick.C:
+		case <-e.poke:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(0)
+		case <-timer.C:
 			e.mu.Lock()
 			e.step(time.Now())
+			timer.Reset(e.every())
 			e.mu.Unlock()
 		}
 	}
+}
+
+// every is how soon the engine looks again: often while it sends, seldom while nothing moves, so a
+// pause costs the battery little.
+func (e *engine) every() time.Duration {
+	switch {
+	case e.want == nil:
+		return tickIdle
+	case e.s != nil && (e.s.phase == phPlaying || (e.s.phase == phFlushing && e.s.jumping)):
+		return tickPlaying // sending, or a pause playing out
+	}
+	return tickWaiting
 }
 
 // end lets the speaker go and the Q2 play aloud again.

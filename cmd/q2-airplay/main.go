@@ -25,7 +25,7 @@ import (
 	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
-const version = "q2-v1.0"
+const version = "q2-v1.1"
 
 // settings is .airplay/config.json.
 type settings struct {
