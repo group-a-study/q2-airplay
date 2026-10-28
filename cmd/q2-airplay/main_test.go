@@ -183,6 +183,7 @@ type filter struct {
 	t       *tap
 	mu      sync.Mutex
 	playing bool
+	stalled bool // playing, but writing nothing: a starved player
 	pts     int32
 	id      uint32
 	stop    chan struct{}
@@ -198,7 +199,7 @@ func (f *filter) run() {
 		case <-tick.C:
 		}
 		f.mu.Lock()
-		if f.playing {
+		if f.playing && !f.stalled {
 			f.block(tapRate / 10)
 		}
 		f.mu.Unlock()
@@ -555,6 +556,94 @@ func TestNoDeadlock(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(state.Path); !strings.Contains(string(b), "hold=1") {
 		t.Fatalf("no hold while a speaker plays: %q", b)
+	}
+}
+
+// TestStall starves the player while it plays: a short stall goes to the speaker as the same silence
+// and the stream runs on, nothing lost or repeated; one too long to bridge starts the stream again
+// from where it stood. Either way the speaker plays again once the player does.
+func TestStall(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "fake")
+	os.Mkdir(fake, 0o755)
+	t.Setenv("FAKE_CLIAIRPLAY", fake)
+	tp, err := openTap(filepath.Join(dir, "q2cast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &filter{t: tp, id: 1, stop: make(chan struct{})}
+	defer close(f.stop)
+	f.set(true)
+	go f.run()
+	e := newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: "0011223344556677",
+		remote: "1", track: filepath.Join(dir, "track"), delayMS: func() int { return 400 }})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { e.run(stop); close(done) }()
+	defer func() { close(stop); <-done }()
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true}
+	e.choose(&sp)
+	waitFor(t, "START", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
+	frames := func() []uint16 {
+		b, _ := os.ReadFile(filepath.Join(fake, "audio"))
+		s := make([]uint16, 0, len(b)/4)
+		for i := 0; i+4 <= len(b); i += 4 {
+			s = append(s, binary.LittleEndian.Uint16(b[i:]))
+		}
+		return s
+	}
+	stall := func(d time.Duration) uint32 {
+		time.Sleep(600 * time.Millisecond)
+		f.mu.Lock()
+		f.stalled = true
+		at := tp.u32(offSeq)
+		f.mu.Unlock()
+		time.Sleep(d)
+		f.mu.Lock()
+		f.stalled = false
+		f.mu.Unlock()
+		return at
+	}
+	// 1 s: the gap comes out as about 1 s of silence (frames of zeros), then the frame after the last
+	at := stall(time.Second)
+	waitFor(t, "audio after the short stall", 3*time.Second, func() bool {
+		s := frames()
+		return len(s) > 0 && int(s[len(s)-1]-uint16(at)) > tapRate/2 && int(s[len(s)-1]-uint16(at)) < 32768
+	})
+	if has(fake, "ACTION=FLUSH") != 0 {
+		t.Fatalf("a 1 s stall flushed: %v", commands(fake))
+	}
+	s := frames()
+	zeros, i := 0, 0
+	for i = 1; i < len(s); i++ {
+		if s[i] != s[i-1]+1 {
+			break
+		}
+	}
+	for ; i < len(s) && s[i] == 0 && s[i-1] != 0xffff; i++ {
+		zeros++
+	}
+	if i >= len(s) || s[i] != uint16(at) || zeros < tapRate*8/10 || zeros > tapRate*13/10 {
+		t.Fatalf("after the stall: %d frames of silence, then %d (want about %d, then %d)", zeros, s[min(i, len(s)-1)], tapRate, uint16(at))
+	}
+	// 6 s, past restartMS: flushed and started again from the frame where it stood
+	at = stall(6 * time.Second)
+	waitFor(t, "a new start after the long stall", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 2 })
+	if has(fake, "ACTION=FLUSH") != 1 {
+		t.Fatalf("%v", commands(fake))
+	}
+	waitFor(t, "audio after the long stall", 3*time.Second, func() bool {
+		s := frames()
+		return len(s) > 0 && int(s[len(s)-1]-uint16(at)) > tapRate/2 && int(s[len(s)-1]-uint16(at)) < 32768
+	})
+	s = frames()
+	for i := 1; i < len(s); i++ { // frames only ever run on, or pause for silence: none lost or repeated
+		if s[i] == 0 || s[i-1] == 0 {
+			continue
+		}
+		if s[i] != s[i-1]+1 {
+			t.Fatalf("frame %d: %d after %d", i, s[i], s[i-1])
+		}
 	}
 }
 

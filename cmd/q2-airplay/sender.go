@@ -84,6 +84,7 @@ func startSender(o senderOptions) (*sender, error) {
 		pipe.Close()
 		return nil, err
 	}
+	syscall.Setpriority(syscall.PRIO_PROCESS, cmd.Process.Pid, senderNice) // root on the Q2; refused, it runs as is
 	s := &sender{cmd: cmd, stdin: stdin, pipe: pipe, events: make(chan event, 64),
 		audio: make(chan []byte, 64), idle: make(chan struct{}, 1)}
 	var wg sync.WaitGroup

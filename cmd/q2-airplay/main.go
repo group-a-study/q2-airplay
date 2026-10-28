@@ -26,7 +26,9 @@ import (
 	"github.com/group-a-study/q2-airplay/internal/q2spot"
 )
 
-const version = "q2-v1.3"
+const version = "q2-v1.4"
+
+const appNice, senderNice = -5, -8 // the app's and cliairplay's (its PTP and sends keep time)
 
 // settings is .airplay/config.json.
 type settings struct {
@@ -71,6 +73,9 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	// hciplayer runs at nice -5: at the same priority, nothing else on the Q2 starves the stream (on
+	// one core, a hi-res album and Low Power's dark screen did); cliairplay goes a little above.
+	syscall.Setpriority(syscall.PRIO_PROCESS, 0, appNice)
 	a := &app{dir: *dir, started: time.Now()}
 	a.load()
 	t, err := openTap(tapFile)
