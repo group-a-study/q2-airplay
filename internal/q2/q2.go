@@ -18,6 +18,13 @@ func MonoNS() int64 {
 	return int64(ts.Sec)*1e9 + int64(ts.Nsec)
 }
 
+// RawNS is CLOCK_MONOTONIC_RAW in nanoseconds: what NTP never steps or slews.
+func RawNS() int64 {
+	var ts syscall.Timespec
+	syscall.Syscall(syscall.SYS_CLOCK_GETTIME, 4, uintptr(unsafe.Pointer(&ts)), 0)
+	return int64(ts.Sec)*1e9 + int64(ts.Nsec)
+}
+
 // State is a key=value status file rewritten whole (a .tmp, renamed), so a reader never sees half of
 // one. Values have newlines replaced, as the payload's field() reads a line.
 type State struct {

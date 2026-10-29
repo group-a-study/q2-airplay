@@ -38,12 +38,6 @@ If the sound drops, the AirPlay page's **Dropouts** line says how many there wer
 last one: the Q2's player stopping, audio reaching the speaker late over Wi-Fi, the speaker losing the
 Q2's clock, or the connection ending.
 
-**Troubleshooting log (for now):** while dropouts are being chased, the app keeps a log at the card's
-root, `q2-airplay.log` (2 MB, then `q2-airplay.log.1`). It records the app's steps, cliairplay's own
-messages, and every 2 s the player's output, the audio device's state, CPU, load and Wi-Fi signal. It's
-written every few seconds, so after a dropout wait 10 s, then copy it off (USB or File Browser). It goes
-away once the dropouts are fixed.
-
 What can't be played on a speaker: DSD (it goes to the Q2's DAC untouched). Spotify, Internet Radio and
 Videos have their own players, which this doesn't reach.
 
@@ -58,8 +52,11 @@ Videos have their own players, which this doesn't reach.
   - hands the audio to cliairplay, a fixed delay behind the tap (`cast.go`).
 - **The sender:** cliairplay is [Music Assistant's AirPlay sender](https://github.com/music-assistant/airplay-cli),
   built for the Q2 by `contrib/shanlingq2/build-cliairplay.sh`. It does the protocol work: pairing,
-  PTP timing, the buffered stream Sonos speakers take, and the speaker's now-playing.
+  PTP timing, the buffered stream Sonos speakers take, and the speaker's now-playing. Its clock, which
+  the speaker follows, is the Q2's raw monotonic one, so the Q2 setting its clock from the network (each
+  time Wi-Fi connects) never jolts the speaker.
 - **AirPlay 2 or 1:** AirPlay 2 comes first. If it can't connect, the app tries the speaker over AirPlay 1.
+  A connection that worked is tried the same way again if it's lost.
 - **Battery:** audio is sent in 200 ms bursts, so the Wi-Fi can doze between them. Paused, the stream
   stops; nothing is looked for or sent until the page opens or a speaker is chosen. The app ends by
   itself once unused for 10 minutes.

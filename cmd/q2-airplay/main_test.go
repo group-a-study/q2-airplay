@@ -23,29 +23,36 @@ import (
 // commands and its stdin there and answers as the real one does (DESIGN.md's [STATUS] lines).
 func TestMain(m *testing.M) {
 	if dir := os.Getenv("FAKE_CLIAIRPLAY"); dir != "" {
-		fakeSender(dir, os.Args[1:])
-		os.Exit(0)
+		os.Exit(fakeSender(dir, os.Args[1:]))
 	}
-	if p := os.Getenv("Q2_TEST_LOG"); p != "" { // the troubleshooting log, read on this machine
-		dbg = openLog(p)
-		defer dbg.flush()
-	}
-	code := m.Run()
-	dbg.flush()
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
-func fakeSender(dir string, args []string) {
-	pipe := ""
+// fakeSender also appends its arguments to starts, a line each run. A file fail-PROTOCOL there makes
+// a run with that --protocol fail before it connects; TEST=IDLE on the command pipe ends it as
+// parked 2 min does, TEST=EXIT as a lost connection does.
+func fakeSender(dir string, args []string) int {
+	pipe, proto := "", ""
 	for i, a := range args {
-		if a == "--cmdpipe" {
+		switch a {
+		case "--cmdpipe":
 			pipe = args[i+1]
+		case "--protocol":
+			proto = args[i+1]
 		}
 	}
-	os.WriteFile(filepath.Join(dir, "args"), []byte(strings.Join(args, "\n")), 0o644)
 	audio, _ := os.Create(filepath.Join(dir, "audio"))
 	var mu sync.Mutex
 	marks, _ := os.Create(filepath.Join(dir, "commands"))
+	os.WriteFile(filepath.Join(dir, "args"), []byte(strings.Join(args, "\n")), 0o644)
+	if f, err := os.OpenFile(filepath.Join(dir, "starts"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644); err == nil {
+		fmt.Fprintln(f, strings.Join(args, " "))
+		f.Close()
+	}
+	if _, err := os.Stat(filepath.Join(dir, "fail-"+proto)); err == nil {
+		fmt.Fprintln(os.Stderr, "[STATUS] error code=connect_failed http=0 detail=\"no answer\"")
+		return 1
+	}
 	got := 0
 	go func() {
 		buf := make([]byte, 65536)
@@ -66,7 +73,7 @@ func fakeSender(dir string, args []string) {
 	fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=ready streak_ms=2400 exchanges=12 ready_in_ms=0 ready_at_unix_ms=0")
 	f, err := os.Open(pipe)
 	if err != nil {
-		return
+		return 0
 	}
 	sc := bufio.NewScanner(f)
 	start := ""
@@ -84,9 +91,15 @@ func fakeSender(dir string, args []string) {
 			fmt.Fprintln(os.Stderr, "[STATUS] flushed")
 		case line == "ACTION=STOP":
 			fmt.Fprintln(os.Stderr, "[STATUS] stopped")
-			return
+			return 0
+		case line == "TEST=IDLE":
+			fmt.Fprintln(os.Stderr, "[STATUS] idle_timeout")
+			return 0
+		case line == "TEST=EXIT":
+			return 0
 		}
 	}
+	return 0
 }
 
 func TestParseStatus(t *testing.T) {
@@ -383,7 +396,8 @@ func TestEngine(t *testing.T) {
 	// Connected, then started from what plays: the Q2 muted, demo told it plays.
 	waitFor(t, "START", 3*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
 	args, _ := os.ReadFile(filepath.Join(fake, "args"))
-	for _, want := range []string{"--protocol\nauto", "--volume\n0", "--txt\nfeatures=0x445F8A00,0x1C340", "--latency\n900", "127.0.0.1"} {
+	for _, want := range []string{"--protocol\nauto", "--volume\n0", "--txt\nfeatures=0x445F8A00,0x1C340", "--latency\n900",
+		"--debug\n0", "--clock-offset-ns\n", "127.0.0.1"} {
 		if !strings.Contains(string(args), want) {
 			t.Fatalf("args %q lack %q", args, want)
 		}
@@ -401,6 +415,16 @@ func TestEngine(t *testing.T) {
 	}
 	if d := startAt - time.Now().UnixMilli(); d < 0 || d > delay+150 {
 		t.Fatalf("starts %d ms from now, not about %d", d, delay)
+	}
+	// on cliairplay's clock: CLOCK_MONOTONIC_RAW plus the offset it was given, which no setting of the
+	// wall clock moves
+	_, off, _ := strings.Cut(string(args), "--clock-offset-ns\n")
+	clock, err := strconv.ParseInt(strings.SplitN(off, "\n", 2)[0], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := startAt - (q2.RawNS()+clock)/1e6; d < 0 || d > delay+150 {
+		t.Fatalf("starts %d ms from now on cliairplay's clock, not about %d", d, delay)
 	}
 	waitFor(t, "the mute", time.Second, func() bool { return tp.u32(offMute) == 1 && tp.u32(offState) == castOn })
 	if tp.i32(offSpk) != 60 || tp.u32(offSpkSeq) != 1 {
@@ -716,5 +740,189 @@ func TestArt(t *testing.T) {
 	}
 	if findArt(filepath.Join(other, "missing.flac"), out) != "" {
 		t.Fatal("art for nothing")
+	}
+}
+
+// heard is the audio the stand-in got: each frame's left sample.
+func heard(fake string) []uint16 {
+	b, _ := os.ReadFile(filepath.Join(fake, "audio"))
+	s := make([]uint16, 0, len(b)/4)
+	for i := 0; i+4 <= len(b); i += 4 {
+		s = append(s, binary.LittleEndian.Uint16(b[i:]))
+	}
+	return s
+}
+
+// silenceBefore is how many frames of silence came between frame seq-1 and frame seq, the last time
+// they came; -1 when they didn't.
+func silenceBefore(s []uint16, seq uint32) int {
+	for q := len(s) - 1; q > 0; q-- {
+		if s[q] != uint16(seq) {
+			continue
+		}
+		z := 0
+		for q-1-z > 0 && s[q-1-z] == 0 {
+			z++
+		}
+		if s[q-1-z] == uint16(seq-1) {
+			return z
+		}
+	}
+	return -1
+}
+
+// TestSongGap: the moment between two songs, the player draining one and opening the next, reaches
+// the speaker as the same silence, however short (dropped, each song brought the speaker's place
+// nearer, until Wi-Fi's hiccups broke it up); as short a gap within a song is the tap's unevenness,
+// not silence. Neither is a dropout.
+func TestSongGap(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "fake")
+	os.Mkdir(fake, 0o755)
+	t.Setenv("FAKE_CLIAIRPLAY", fake)
+	tp, err := openTap(filepath.Join(dir, "q2cast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &filter{t: tp, id: 1, stop: make(chan struct{})}
+	defer close(f.stop)
+	f.set(true)
+	go f.run()
+	e := newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: "0011223344556677",
+		remote: "1", track: filepath.Join(dir, "track"), delayMS: func() int { return 400 }})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { e.run(stop); close(done) }()
+	defer func() { close(stop); <-done }()
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true}
+	e.choose(&sp)
+	waitFor(t, "START", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 1 })
+	const gap = 60 // ms
+	// The player writes nothing for half a second, then (song's) frames at once, reaching back to gap
+	// after its last: as it drains a song, then opens the next and fills its buffer. It goes on from
+	// there at its pace once the engine has seen the fill (the stand-in's writes are a whole 100 ms at
+	// once; the player's are spread over it, so the engine never dates the fill from a later one).
+	stamp := func() int64 { return int64(uint64(tp.u32(offStamp)) | uint64(tp.u32(offStamp+4))<<32) }
+	still := func(song uint32) uint32 {
+		time.Sleep(700 * time.Millisecond)
+		f.mu.Lock()
+		f.stalled = true
+		f.mu.Unlock()
+		time.Sleep(500 * time.Millisecond)
+		f.mu.Lock()
+		at := tp.u32(offSeq)
+		f.id = song
+		f.block(int((q2.MonoNS()-stamp())*tapRate/1e9) - gap*tapRate/1000)
+		f.mu.Unlock()
+		time.Sleep(120 * time.Millisecond) // a tick of the engine's
+		f.mu.Lock()
+		f.block(int((q2.MonoNS() - stamp()) * tapRate / 1e9))
+		f.stalled = false
+		f.mu.Unlock()
+		return at
+	}
+	after := func(at uint32) {
+		waitFor(t, "audio after the gap", 3*time.Second, func() bool {
+			s := heard(fake)
+			return len(s) > 0 && int(s[len(s)-1]-uint16(at)) > tapRate/2 && int(s[len(s)-1]-uint16(at)) < 32768
+		})
+	}
+	before := e.dropouts(time.Now())
+	at := still(2)
+	after(at)
+	if z := silenceBefore(heard(fake), at); z < gap*tapRate/1000*3/4 || z > gap*tapRate/1000*5/4 {
+		t.Fatalf("%d frames of silence between the songs, not about %d", z, gap*tapRate/1000)
+	}
+	at = still(2)
+	after(at)
+	if z := silenceBefore(heard(fake), at); z != 0 {
+		t.Fatalf("%d frames of silence within a song", z)
+	}
+	if d := e.dropouts(time.Now()); d != before {
+		t.Fatalf("the page says %q", d)
+	}
+}
+
+// TestReconnect: cliairplay ending itself, parked 2 min, is no dropout: it's connected again at once,
+// still over AirPlay 2. A connection lost while playing is a dropout, tried again the same way (1.5 went
+// to AirPlay 1, a real-time stream that Wi-Fi breaks up). AirPlay 1 comes only when AirPlay 2 can't
+// connect, and stays while it works.
+func TestReconnect(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "fake")
+	os.Mkdir(fake, 0o755)
+	t.Setenv("FAKE_CLIAIRPLAY", fake)
+	tp, err := openTap(filepath.Join(dir, "q2cast"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &filter{t: tp, id: 1, stop: make(chan struct{})}
+	defer close(f.stop)
+	f.set(true)
+	go f.run()
+	e := newEngine(tp, engineOptions{bin: os.Args[0], cmdpipe: filepath.Join(dir, "cmd"), dacp: "0011223344556677",
+		remote: "1", track: filepath.Join(dir, "track"), delayMS: func() int { return 400 }})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { e.run(stop); close(done) }()
+	defer func() { close(stop); <-done }()
+	protocols := func() []string {
+		b, _ := os.ReadFile(filepath.Join(fake, "starts"))
+		var p []string
+		for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+			_, rest, _ := strings.Cut(line, "--protocol ")
+			p = append(p, strings.Fields(rest)[0])
+		}
+		return p
+	}
+	runs := func(n int, why string) []string {
+		t.Helper()
+		waitFor(t, why, 6*time.Second, func() bool { return len(protocols()) == n })
+		return protocols()
+	}
+	tell := func(line string) { // to the running stand-in, on its command pipe
+		p, err := os.OpenFile(filepath.Join(dir, "cmd"), os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.WriteString(line + "\n")
+		p.Close()
+	}
+	started := func() { waitFor(t, "START", 4*time.Second, func() bool { return has(fake, "ACTION=START") == 1 }) }
+	sp := speaker{Name: "Kitchen", IP: "127.0.0.1", Port: 1, AirPlay2: true}
+	e.choose(&sp)
+	started()
+
+	f.set(false)
+	waitFor(t, "the pause's FLUSH", 3*time.Second, func() bool { return has(fake, "ACTION=FLUSH") == 1 })
+	tell("TEST=IDLE")
+	if p := runs(2, "a new connection after the idle end"); p[1] != "auto" {
+		t.Fatalf("after the idle end: %v", p)
+	}
+	if d := e.dropouts(time.Now()); d != "" {
+		t.Fatalf("the idle end noted: %q", d)
+	}
+	f.set(true)
+	started()
+
+	tell("TEST=EXIT")
+	if p := runs(3, "a new connection after the loss"); p[2] != "auto" {
+		t.Fatalf("after a lost connection: %v", p)
+	}
+	if d := e.dropouts(time.Now()); !strings.HasPrefix(d, "1 dropout; the last, just now: the connection to Kitchen ended") {
+		t.Fatalf("the page says %q", d)
+	}
+	started()
+
+	os.WriteFile(filepath.Join(fake, "fail-auto"), nil, 0o644) // AirPlay 2 can't connect: AirPlay 1 at once
+	tell("TEST=EXIT")
+	if p := runs(5, "AirPlay 1 after AirPlay 2 failed"); p[3] != "auto" || p[4] != "airplay2-compat" {
+		t.Fatalf("%v", p)
+	}
+	started()
+	os.Remove(filepath.Join(fake, "fail-auto"))
+	tell("TEST=EXIT") // AirPlay 1 worked: tried again
+	if p := runs(6, "a new connection after AirPlay 1's loss"); p[5] != "airplay2-compat" {
+		t.Fatalf("%v", p)
 	}
 }

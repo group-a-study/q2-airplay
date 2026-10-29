@@ -24,7 +24,7 @@ const (
 	tickWaiting   = 250 * time.Millisecond // connecting, paused or parked: within a quarter second of Play
 	tickIdle      = time.Second            // no speaker chosen
 	batchMS       = 200                    // audio is sent in bursts this long: the radio sleeps between them
-	gapMS         = 150                    // tap frames this much later than their place on the speaker's timeline: a gap (pause, stall), kept as silence
+	gapMS         = 150                    // tap frames this much later than their place on the speaker's timeline, within a song: a gap (pause, stall), kept as silence
 	restartMS     = 5000                   // a gap this long: flushed and started again instead
 	parkAfterMS   = 100                    // paused this long past the last frame heard: flushed and parked
 	minLeadMS     = 300                    // a start at least this far ahead
@@ -63,11 +63,14 @@ type obs struct {
 type session struct {
 	sp         speaker
 	snd        *sender
-	compat     bool // the AirPlay 1 flow, after AirPlay 2 failed
+	compat     bool  // the AirPlay 1 flow, after AirPlay 2 failed
+	clock      int64 // cliairplay's clock is CLOCK_MONOTONIC_RAW plus this, ns (cliMS)
+	idled      bool  // cliairplay said idle_timeout: parked so long it ends by itself
 	phase      phase
 	connected  time.Time
 	clockReady bool
 	fed        uint32  // the next frame to send
+	song       uint32  // the filter instance (one a song) of the frame before it
 	nextAud    float64 // CLOCK_MONOTONIC ms the next frame sent is heard at
 	pending    []byte
 	lastSend   time.Time
@@ -99,6 +102,7 @@ type engine struct {
 	obs           []obs
 	retryAt       time.Time
 	retries       int
+	compat        bool           // the next connection tries AirPlay 1
 	asked         *levelAsk      // the chosen speaker's volume being read
 	levels        map[string]int // each speaker's last volume
 	levelsChanged bool
@@ -107,13 +111,10 @@ type engine struct {
 	trouble   string
 	troubleAt time.Time
 	troubles  int
-	probe     probe
-	heartAt   time.Time
 }
 
 // note records a dropout's cause for the page.
 func (e *engine) note(now time.Time, why string) {
-	dbg.printf("dropout: %s", why)
 	e.trouble, e.troubleAt = why, now
 	e.troubles++
 }
@@ -184,6 +185,7 @@ func (e *engine) choose(sp *speaker) {
 	e.want = sp
 	e.retries = 0
 	e.retryAt = time.Time{}
+	e.compat = false
 	e.troubles, e.trouble = 0, ""
 	if e.s != nil && (sp == nil || sp.key() != e.s.sp.key()) {
 		e.end("")
@@ -271,14 +273,16 @@ func (e *engine) end(why string) {
 	}
 }
 
-// The speaker's timeline is kept in CLOCK_MONOTONIC ms, so a jump of the wall clock (set from the
-// network once Wi-Fi is back, say) moves nothing; only START's instant is wall-clock, as cliairplay
-// takes it.
+// The speaker's timeline is kept in CLOCK_MONOTONIC ms, so a jump of the wall clock moves nothing.
+// Nor does it move cliairplay's: it runs on CLOCK_MONOTONIC_RAW plus a fixed offset
+// (--clock-offset-ns), not on the wall clock, which the Q2 steps each time Wi-Fi connects, waking
+// included (to the network's time, then again to the whole second). The speaker follows cliairplay's
+// clock (PTP), and each step jolted it.
 func monoMS(ns int64) float64 { return float64(ns) / 1e6 }
 
-// unixAt is the wall-clock ms of the monotonic ms at.
-func unixAt(at float64, now time.Time, monoNow int64) int64 {
-	return int64(at + float64(now.UnixNano())/1e6 - monoMS(monoNow))
+// cliMS is the monotonic ms at on cliairplay's clock, as START_UNIX_MS takes it.
+func (s *session) cliMS(at float64) int64 {
+	return int64(at + monoMS(q2.RawNS()-q2.MonoNS()+s.clock))
 }
 
 // see keeps the filter's head when it moved, for tap times and song places (10 s of them).
@@ -329,6 +333,12 @@ func (e *engine) place(seq uint32) (uint32, int32) {
 	return 0, 0
 }
 
+// song is the filter instance (one a song) that wrote frame seq.
+func (e *engine) song(seq uint32) uint32 {
+	id, _ := e.place(seq + 1) // a sight's id is its frame before seq's
+	return id
+}
+
 func (e *engine) step(now time.Time) {
 	t := e.t
 	monoNow := q2.MonoNS()
@@ -354,7 +364,7 @@ func (e *engine) step(now time.Time) {
 			t.beat(monoNow, false, castConnecting)
 			return
 		}
-		if err := e.begin(now, monoNow, h, e.retries > 0 && e.retries%2 == 1); err != nil {
+		if err := e.begin(now, monoNow, h, e.compat); err != nil {
 			e.status = "Can't start AirPlay: " + err.Error()
 			e.want = nil
 			t.stop()
@@ -428,16 +438,6 @@ func (e *engine) step(now time.Time) {
 		e.status = "Playing on " + s.sp.Name
 	}
 	e.extras(now, monoNow)
-	if dbg != nil && now.Sub(e.heartAt) >= heartEvery {
-		e.heartAt = now
-		pid := 0
-		if s.snd.cmd.Process != nil {
-			pid = s.snd.cmd.Process.Pid
-		}
-		dbg.printf("hb phase=%d status=%d seq=%d fed=%d lag=%d lead=%.0fms pending=%d q=%d stamp_age=%dms dsd=%v vol=%d %s",
-			s.phase, t.status(), h.seq, s.fed, int32(h.seq-s.fed), s.nextAud-monoMS(monoNow), len(s.pending),
-			len(s.snd.audio), (monoNow-h.stamp)/1e6, h.dsd, t.volume(), e.probe.line(now, t, pid))
-	}
 }
 
 // begin starts cliairplay for the chosen speaker; compat: the AirPlay 1 flow.
@@ -466,16 +466,15 @@ func (e *engine) begin(now time.Time, monoNow int64, h head, compat bool) error 
 	if known {
 		send = 0 // as it is
 	}
+	clock := now.UnixNano() - q2.RawNS() // read as the wall clock, which it then never follows
 	snd, err := startSender(senderOptions{bin: e.opt.bin, cmdpipe: e.opt.cmdpipe, dacp: e.opt.dacp,
 		remote: e.opt.remote, name: "Shanling Q2", protocol: proto, volume: send,
-		latencyMS: e.opt.delayMS() + 500, sp: sp})
+		latencyMS: e.opt.delayMS() + 500, clockNS: clock, sp: sp})
 	if err != nil {
 		return err
 	}
-	e.s = &session{sp: sp, snd: snd, compat: compat, volume: int32(vol), jumps: h.jumps,
+	e.s = &session{sp: sp, snd: snd, compat: compat, clock: clock, volume: int32(vol), jumps: h.jumps,
 		track: e.t.track()} // start sends the tags
-	dbg.printf("begin %s %s:%d airplay2=%v proto=%s volume=%d (the speaker's own: %v) delay=%d", sp.Name, sp.IP,
-		sp.Port, sp.AirPlay2, proto, vol, known, e.opt.delayMS())
 	e.t.setLevel(clampVolume(vol))
 	e.t.setSpeaker(sp.Name)
 	e.status = "Connecting to " + sp.Name + "…"
@@ -502,7 +501,6 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		default:
 			return
 		}
-		dbg.printf("event %s", ev)
 		switch ev.kind {
 		case "connected":
 			s.connected = now
@@ -540,13 +538,14 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 		case "flushed":
 			if s.phase == phFlushing {
 				s.phase = phParked
-				dbg.printf("parked (jump=%v)", s.jumping)
 				if s.jumping {
 					s.jumping = false
 					s.fed = s.jumpTo
 					e.start(now, monoNow, s.fed)
 				}
 			}
+		case "idle_timeout": // parked 2 min: cliairplay ends by itself
+			s.idled = true
 		case "error", "fatal":
 			if d := ev.kv["detail"]; d != "" {
 				s.err = d
@@ -561,13 +560,20 @@ func (e *engine) events(now time.Time, monoNow int64, h head) {
 	}
 }
 
-// lost: cliairplay ended without being asked. AirPlay 2 failing before it connected tries AirPlay 1
-// next; then again after a pause, longer each time.
+// lost: cliairplay ended without being asked. Ended for being parked 2 min, it's no dropout: it's
+// connected again at once, the same way. A connection that worked is tried the same way again; AirPlay
+// 2 failing before it connected tries AirPlay 1 at once, and AirPlay 1 failing so tries AirPlay 2.
+// Each try after a failure waits a little longer.
 func (e *engine) lost(now time.Time, h head) {
 	s := e.s
 	e.s = nil
 	s.snd.stop() // its writer let go; a stuck one killed
 	e.t.stop()
+	e.compat = s.compat
+	if s.idled && s.err == "" {
+		e.retryAt = now
+		return
+	}
 	why := s.err
 	if why == "" {
 		why = "the connection ended"
@@ -575,13 +581,14 @@ func (e *engine) lost(now time.Time, h head) {
 	if s.started {
 		e.note(now, "the connection to "+s.sp.Name+" ended: "+why)
 	}
-	dbg.printf("lost %s: %s (connected %v, AirPlay 1 %v, retries %d)", s.sp.Name, why, !s.connected.IsZero(),
-		s.compat, e.retries)
 	e.retries++
-	if s.connected.IsZero() && s.sp.AirPlay2 && !s.compat {
-		e.retryAt = now // straight to AirPlay 1
-		e.status = "Connecting to " + s.sp.Name + "…"
-		return
+	if s.connected.IsZero() && s.sp.AirPlay2 {
+		e.compat = !s.compat
+		if e.compat {
+			e.retryAt = now // straight to AirPlay 1
+			e.status = "Connecting to " + s.sp.Name + "…"
+			return
+		}
 	}
 	wait := time.Duration(e.retries) * 3 * time.Second
 	if wait > 30*time.Second {
@@ -602,11 +609,11 @@ func (e *engine) start(now time.Time, monoNow int64, from uint32) {
 		e.metadata(now) // Sonos plays nothing before it has the tags
 	}
 	s.fed = from
+	s.song = e.song(from) // no song's gap before the first frame
 	s.nextAud = at
 	s.runs = s.runs[:0]
 	s.pending = s.pending[:0]
-	s.snd.command(fmt.Sprintf("START_UNIX_MS=%d", unixAt(at, now, monoNow)), "ACTION=START")
-	dbg.printf("start from=%d lead=%.0fms (tap +%d ms)", from, at-monoMS(monoNow), e.opt.delayMS())
+	s.snd.command(fmt.Sprintf("START_UNIX_MS=%d", s.cliMS(at)), "ACTION=START")
 	s.phase = phPlaying
 	s.started = true
 }
@@ -635,10 +642,11 @@ func (e *engine) feed(now time.Time, monoNow int64, h head) {
 		e.note(now, fmt.Sprintf("the Q2's player stopped giving audio for %.1f s", gap/1000))
 	}
 	s.paused = false
-	if gap > gapMS {
-		dbg.printf("gap %.0fms before frame %d (paused or stalled)", gap, s.fed)
-	}
-	if gap > gapMS { // a pause or a stall on the Q2: the same silence here
+	// A pause or a stall on the Q2: the same silence here. So too a new song's gap, however short: the
+	// Q2's own, while its player drains one song and opens the next. Dropped, each would bring the
+	// speaker's place ~40 ms nearer, until after a couple of hours it held too little to ride out the
+	// Wi-Fi's hiccups. Shorter gaps within a song are the tap's own unevenness, not silence.
+	if gap > gapMS || (gap > 0 && e.song(s.fed) != s.song) {
 		k := int(gap * tapRate / 1000)
 		s.pending = append(s.pending, make([]byte, 4*k)...)
 		s.nextAud += float64(k) * 1000 / tapRate
@@ -649,6 +657,7 @@ func (e *engine) feed(now time.Time, monoNow int64, h head) {
 	}
 	s.pending = e.t.frames(s.pending, s.fed, n)
 	s.fed += uint32(n)
+	s.song = e.song(s.fed - 1)
 	s.nextAud += float64(n) * 1000 / tapRate
 	e.sendPending(now, false) // may end the session
 }
@@ -675,7 +684,6 @@ func (e *engine) flush(jump bool, to uint32) {
 	s.pending = s.pending[:0]
 	s.snd.drained(time.Second)
 	s.snd.command("ACTION=FLUSH")
-	dbg.printf("flush jump=%v to=%d", jump, to)
 	s.phase = phFlushing
 	s.jumping = jump
 	s.jumpTo = to

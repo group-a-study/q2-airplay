@@ -15,7 +15,8 @@ import (
 
 // A sender is one cliairplay (music-assistant/airplay-cli, built for the Q2: contrib/shanlingq2) for
 // one speaker: 16-bit stereo at tapRate on its stdin, KEY=VALUE commands on its command pipe, and its
-// "[STATUS] …" lines, on stdout and stderr both, as events. Its other output is dropped.
+// "[STATUS] …" lines, on stdout and stderr both, as events. Its log is off (--debug 0); anything else
+// it prints is dropped.
 
 type event struct {
 	kind string            // "connected", "started", "flushed", "clock_ready", "error", "exit", …
@@ -37,6 +38,7 @@ type senderOptions struct {
 	bin, cmdpipe, dacp, remote, name string
 	protocol                         string // auto, or airplay2-compat for the fallback
 	volume, latencyMS                int
+	clockNS                          int64 // its clock: CLOCK_MONOTONIC_RAW plus this (cast.go's cliClock)
 	sp                               speaker
 }
 
@@ -47,7 +49,8 @@ func startSender(o senderOptions) (*sender, error) {
 	}
 	args := []string{"--protocol", o.protocol, "--port", strconv.Itoa(o.sp.Port),
 		"--volume", strconv.Itoa(o.volume), "--dacp", o.dacp, "--activeremote", o.remote,
-		"--name", o.name, "--hostname", "shanling-q2", "--debug", debugLevel(), "--cmdpipe", o.cmdpipe}
+		"--name", o.name, "--hostname", "shanling-q2", "--debug", "0", "--cmdpipe", o.cmdpipe,
+		"--clock-offset-ns", strconv.FormatInt(o.clockNS, 10)}
 	if o.latencyMS > 0 {
 		args = append(args, "--latency", strconv.Itoa(o.latencyMS))
 	}
@@ -60,7 +63,6 @@ func startSender(o senderOptions) (*sender, error) {
 		}
 	}
 	args = append(args, o.sp.IP)
-	dbg.printf("sender %s %q", o.bin, args)
 	cmd := exec.Command(o.bin, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
@@ -85,8 +87,7 @@ func startSender(o senderOptions) (*sender, error) {
 		pipe.Close()
 		return nil, err
 	}
-	err = syscall.Setpriority(syscall.PRIO_PROCESS, cmd.Process.Pid, senderNice) // root on the Q2; refused, it runs as is
-	dbg.printf("sender pid %d nice %d (%v)", cmd.Process.Pid, senderNice, err)
+	syscall.Setpriority(syscall.PRIO_PROCESS, cmd.Process.Pid, senderNice) // root on the Q2; refused, it runs as is
 	s := &sender{cmd: cmd, stdin: stdin, pipe: pipe, events: make(chan event, 64),
 		audio: make(chan []byte, 64), idle: make(chan struct{}, 1)}
 	var wg sync.WaitGroup
@@ -111,15 +112,6 @@ func startSender(o senderOptions) (*sender, error) {
 	}()
 	go s.write()
 	return s, nil
-}
-
-// debugLevel is cliairplay's: its connection, timing and Wi-Fi notes while the troubleshooting log is
-// on, errors only otherwise.
-func debugLevel() string {
-	if dbg != nil {
-		return "3"
-	}
-	return "1"
 }
 
 // write sends the queued audio to cliairplay's stdin, in order; a nil chunk asks for idle.
@@ -197,7 +189,6 @@ func (s *sender) scan(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 4096), 64<<10)
 	for sc.Scan() {
-		dbg.printf("cli %s", sc.Text())
 		if e, ok := parseStatus(sc.Text()); ok {
 			select {
 			case s.events <- e:
