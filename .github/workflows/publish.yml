@@ -1,0 +1,20 @@
+name: Publish
+# A push to a release/ branch publishes its zip as the release TAG names, on SOURCE (main's commit).
+on:
+  push:
+    branches: ['release/**']
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sha256sum -c SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$(cat TAG)" q2-airplay-*.zip -R "$GITHUB_REPOSITORY" --target "$(cat SOURCE)"
+          --latest --title "q2-airplay ${GITHUB_REF_NAME#release/q2-}" --notes-file NOTES.md
